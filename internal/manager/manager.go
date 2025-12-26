@@ -181,6 +181,81 @@ func (m *Manager) ListContainers() []string {
 	return containers
 }
 
+// ContainerInfo holds detailed information about a container for inspection
+type ContainerInfo struct {
+	Id               string
+	Status           string
+	Runtime          string
+	ParentID         string
+	ChildIDs         []string
+	RootDir          string
+	CodeDir          string
+	ScratchDir       string
+	MemLimitMB       int
+	MemUsageMB       int
+	CPUPercent       int
+	Installs         []string
+	Imports          []string
+	BaseImageName    string
+	BaseImageVersion string
+	CodeUrl          string
+	SeccompEnabled   bool
+	IsZygote         bool
+}
+
+func (m *Manager) GetContainerLogs(id string) (string, error) {
+	c, ok := m.GetContainer(id)
+	if !ok {
+		return "", fmt.Errorf("container not found: %s", id)
+	}
+	return c.GetLogs()
+}
+
+func (m *Manager) InspectContainer(id string) (*ContainerInfo, error) {
+	c, ok := m.GetContainer(id)
+	if !ok {
+		return nil, fmt.Errorf("container not found: %s", id)
+	}
+
+	meta := c.Meta()
+	cg := c.Cgroup()
+
+	// Get child IDs
+	childIDs := make([]string, 0, len(c.Children()))
+	for childID := range c.Children() {
+		childIDs = append(childIDs, childID)
+	}
+
+	// Get parent ID
+	parentID := ""
+	if c.Parent() != nil {
+		parentID = c.Parent().ID()
+	}
+
+	info := &ContainerInfo{
+		Id:               c.ID(),
+		Status:           string(c.Status()),
+		Runtime:          string(meta.Runtime),
+		ParentID:         parentID,
+		ChildIDs:         childIDs,
+		RootDir:          c.RootDir(),
+		CodeDir:          c.CodeDir(),
+		ScratchDir:       c.ScratchDir(),
+		MemLimitMB:       cg.MemLimitMB(),
+		MemUsageMB:       cg.GetMemUsageMB(),
+		CPUPercent:       meta.CPUPercent,
+		Installs:         meta.Installs,
+		Imports:          meta.Imports,
+		BaseImageName:    meta.BaseImageName,
+		BaseImageVersion: meta.BaseImageVersion,
+		CodeUrl:          meta.CodeUrl,
+		SeccompEnabled:   meta.SeccompEnabled,
+		IsZygote:         meta.IsZygote(),
+	}
+
+	return info, nil
+}
+
 func (m *Manager) DestroyContainer(id string) error {
 	container, ok := m.GetContainer(id)
 	if !ok {

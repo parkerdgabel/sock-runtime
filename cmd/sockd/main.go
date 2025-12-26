@@ -270,6 +270,47 @@ func handleConnection(conn net.Conn) {
 				return
 			}
 			log.Printf("Inspecting container: %s", payload.Id)
+			info, err := m.InspectContainer(payload.Id)
+			if err != nil {
+				log.Printf("Failed to inspect container: %v", err)
+				response := message.Response{
+					Success: false,
+					Message: err.Error(),
+				}
+				if err := encoder.Encode(&response); err != nil {
+					log.Printf("Failed to encode response: %v", err)
+					return
+				}
+				continue
+			}
+			response := message.Response{
+				Success: true,
+				Message: fmt.Sprintf("Inspected container: %s", payload.Id),
+				Payload: message.InspectResponse{
+					Id:               info.Id,
+					Status:           info.Status,
+					Runtime:          info.Runtime,
+					ParentID:         info.ParentID,
+					ChildIDs:         info.ChildIDs,
+					RootDir:          info.RootDir,
+					CodeDir:          info.CodeDir,
+					ScratchDir:       info.ScratchDir,
+					MemLimitMB:       info.MemLimitMB,
+					MemUsageMB:       info.MemUsageMB,
+					CPUPercent:       info.CPUPercent,
+					Installs:         info.Installs,
+					Imports:          info.Imports,
+					BaseImageName:    info.BaseImageName,
+					BaseImageVersion: info.BaseImageVersion,
+					CodeUrl:          info.CodeUrl,
+					SeccompEnabled:   info.SeccompEnabled,
+					IsZygote:         info.IsZygote,
+				},
+			}
+			if err := encoder.Encode(&response); err != nil {
+				log.Printf("Failed to encode response: %v", err)
+				return
+			}
 		case message.CommandLogs:
 			payload, ok := msg.Payload.(message.PayloadLogs)
 			if !ok {
@@ -277,6 +318,35 @@ func handleConnection(conn net.Conn) {
 				return
 			}
 			log.Printf("Getting logs for container: %s", payload.Id)
+			logs, err := m.GetContainerLogs(payload.Id)
+			if err != nil {
+				log.Printf("Failed to get logs: %v", err)
+				response := message.Response{
+					Success: false,
+					Message: err.Error(),
+					Payload: message.LogsResponse{
+						Id:    payload.Id,
+						Error: err.Error(),
+					},
+				}
+				if err := encoder.Encode(&response); err != nil {
+					log.Printf("Failed to encode response: %v", err)
+					return
+				}
+				continue
+			}
+			response := message.Response{
+				Success: true,
+				Message: fmt.Sprintf("Retrieved logs for container: %s", payload.Id),
+				Payload: message.LogsResponse{
+					Id:   payload.Id,
+					Logs: logs,
+				},
+			}
+			if err := encoder.Encode(&response); err != nil {
+				log.Printf("Failed to encode response: %v", err)
+				return
+			}
 		case message.CommandFork:
 			payload, ok := msg.Payload.(message.PayloadFork)
 			if !ok {

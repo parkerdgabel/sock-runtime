@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -61,6 +62,9 @@ func NewPackagePullerInstaller(meta *Meta, baseImageDir string, rootDir string, 
 		pipLambdaDir := filepath.Join(baseImageDir, "admin-lambdas", "pip-lambda")
 		packageDir := filepath.Join(baseImageDir, "packages")
 		code := embedded.PyPiPullerInstaller_py
+		if err := os.MkdirAll(pipLambdaDir, 0755); err != nil {
+			return nil, err
+		}
 		if err := os.WriteFile(filepath.Join(pipLambdaDir, "f.py"), []byte(code), 0700); err != nil {
 			return nil, err
 		}
@@ -73,10 +77,57 @@ func NewPackagePullerInstaller(meta *Meta, baseImageDir string, rootDir string, 
 			packageDir:    packageDir,
 			cgroup:        cgroup,
 		}, nil
+	case Node:
+		m := &Meta{
+			Runtime:  Node,
+			isLeaf:   true,
+			ParentID: "",
+		}
+		npmLambdaDir := filepath.Join(baseImageDir, "admin-lambdas", "npm-lambda")
+		packageDir := filepath.Join(baseImageDir, "packages")
+		code := embedded.NpmPullerInstaller_js
+		if err := os.MkdirAll(npmLambdaDir, 0755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(npmLambdaDir, "f.js"), []byte(code), 0700); err != nil {
+			return nil, err
+		}
+		return &NpmPullerInstaller{
+			packages:      sync.Map{},
+			rootDir:       rootDir,
+			baseImageDir:  baseImageDir,
+			npmLambdaDir:  npmLambdaDir,
+			containerMeta: m,
+			packageDir:    packageDir,
+			cgroup:        cgroup,
+		}, nil
+	case Ruby:
+		m := &Meta{
+			Runtime:  Ruby,
+			isLeaf:   true,
+			ParentID: "",
+		}
+		gemLambdaDir := filepath.Join(baseImageDir, "admin-lambdas", "gem-lambda")
+		packageDir := filepath.Join(baseImageDir, "packages")
+		code := embedded.GemPullerInstaller_rb
+		if err := os.MkdirAll(gemLambdaDir, 0755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(gemLambdaDir, "f.rb"), []byte(code), 0700); err != nil {
+			return nil, err
+		}
+		return &GemPullerInstaller{
+			packages:      sync.Map{},
+			rootDir:       rootDir,
+			baseImageDir:  baseImageDir,
+			gemLambdaDir:  gemLambdaDir,
+			containerMeta: m,
+			packageDir:    packageDir,
+			cgroup:        cgroup,
+		}, nil
 	default:
 		return nil, ErrUnsupportedRuntime
 	}
-
 }
 
 type PyPiPullerInstaller struct {
@@ -91,7 +142,42 @@ type PyPiPullerInstaller struct {
 }
 
 func (p *PyPiPullerInstaller) InstallPackages(pkgs []string) ([]string, error) {
-	return nil, nil
+	installed := make([]string, 0, len(pkgs))
+	seen := make(map[string]bool)
+	queue := make([]string, 0, len(pkgs))
+
+	// Normalize and queue initial packages
+	for _, pkg := range pkgs {
+		normalized := p.NormalizePackage(pkg)
+		if !seen[normalized] {
+			queue = append(queue, normalized)
+			seen[normalized] = true
+		}
+	}
+
+	// Process packages and their dependencies
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+
+		pa, err := p.PullPackage(pkg)
+		if err != nil {
+			return installed, fmt.Errorf("failed to install package %s: %w", pkg, err)
+		}
+
+		installed = append(installed, pkg)
+
+		// Queue dependencies that haven't been seen
+		for _, dep := range pa.Meta.Deps {
+			normalized := p.NormalizePackage(dep)
+			if !seen[normalized] {
+				queue = append(queue, normalized)
+				seen[normalized] = true
+			}
+		}
+	}
+
+	return installed, nil
 }
 
 func (p *PyPiPullerInstaller) NormalizePackage(pkg string) string {
@@ -193,6 +279,292 @@ func (p *PyPiPullerInstaller) sandboxInstall(pa *Package) error {
 
 	for i, pkg := range pa.Meta.Deps {
 		pa.Meta.Deps[i] = p.NormalizePackage(pkg)
+	}
+
+	return nil
+}
+
+// NpmPullerInstaller handles npm package installation for Node.js
+type NpmPullerInstaller struct {
+	packages      sync.Map
+	npmLambdaDir  string
+	containerMeta *Meta
+	rootDir       string
+	baseImageDir  string
+	packageDir    string
+	cgroup        *cgroup.Cgroup
+}
+
+func (n *NpmPullerInstaller) InstallPackages(pkgs []string) ([]string, error) {
+	installed := make([]string, 0, len(pkgs))
+	seen := make(map[string]bool)
+	queue := make([]string, 0, len(pkgs))
+
+	for _, pkg := range pkgs {
+		normalized := n.NormalizePackage(pkg)
+		if !seen[normalized] {
+			queue = append(queue, normalized)
+			seen[normalized] = true
+		}
+	}
+
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+
+		pa, err := n.PullPackage(pkg)
+		if err != nil {
+			return installed, fmt.Errorf("failed to install package %s: %w", pkg, err)
+		}
+
+		installed = append(installed, pkg)
+
+		for _, dep := range pa.Meta.Deps {
+			normalized := n.NormalizePackage(dep)
+			if !seen[normalized] {
+				queue = append(queue, normalized)
+				seen[normalized] = true
+			}
+		}
+	}
+
+	return installed, nil
+}
+
+func (n *NpmPullerInstaller) NormalizePackage(pkg string) string {
+	return strings.ToLower(pkg)
+}
+
+func (n *NpmPullerInstaller) PullPackage(pkg string) (*Package, error) {
+	pkg = n.NormalizePackage(pkg)
+	tmp, _ := n.packages.LoadOrStore(pkg, &Package{Name: pkg})
+	pa := tmp.(*Package)
+
+	if atomic.LoadUint32(&pa.installed) == 1 {
+		return pa, nil
+	}
+
+	pa.installMutex.Lock()
+	defer pa.installMutex.Unlock()
+	if pa.installed == 0 {
+		if err := n.sandboxInstall(pa); err != nil {
+			return pa, err
+		}
+		atomic.StoreUint32(&pa.installed, 1)
+		return pa, nil
+	}
+
+	return pa, nil
+}
+
+func (n *NpmPullerInstaller) sandboxInstall(pa *Package) error {
+	scratchDir := filepath.Join(n.packageDir, pa.Name)
+	log.Printf("npm install using scratchDir='%v'", scratchDir)
+	alreadyInstalled := false
+	if _, err := os.Stat(scratchDir); err == nil {
+		log.Printf("Package %v already installed", pa.Name)
+		alreadyInstalled = true
+	} else {
+		log.Printf("run npm install %s from a new Sandbox to %s on host", pa.Name, scratchDir)
+		if err := os.Mkdir(scratchDir, 0700); err != nil {
+			return err
+		}
+	}
+	var err error
+	defer func() {
+		if err != nil {
+			os.RemoveAll(scratchDir)
+		}
+	}()
+
+	defer n.cgroup.Release()
+
+	container, err := NewContainer(nil, n.baseImageDir, uuid.New().String(), n.rootDir, n.npmLambdaDir, scratchDir, n.cgroup, n.containerMeta, nil)
+	if err != nil {
+		return err
+	}
+
+	if err := container.Start(); err != nil {
+		return err
+	}
+	defer container.Destroy()
+
+	pkgReq := PullPackageRequest{
+		Pkg:              pa.Name,
+		AlreadyInstalled: alreadyInstalled,
+	}
+
+	pkgReqBytes, err := json.Marshal(pkgReq)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", "http://lambda/run/npm-lambda", bytes.NewBuffer(pkgReqBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := container.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		log.Printf("Failed to install package %s: %v", pa.Name, res.Status)
+		return fmt.Errorf("npm install failed with status %s", res.Status)
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&pa.Meta); err != nil {
+		return err
+	}
+
+	for i, pkg := range pa.Meta.Deps {
+		pa.Meta.Deps[i] = n.NormalizePackage(pkg)
+	}
+
+	return nil
+}
+
+// GemPullerInstaller handles gem package installation for Ruby
+type GemPullerInstaller struct {
+	packages      sync.Map
+	gemLambdaDir  string
+	containerMeta *Meta
+	rootDir       string
+	baseImageDir  string
+	packageDir    string
+	cgroup        *cgroup.Cgroup
+}
+
+func (g *GemPullerInstaller) InstallPackages(pkgs []string) ([]string, error) {
+	installed := make([]string, 0, len(pkgs))
+	seen := make(map[string]bool)
+	queue := make([]string, 0, len(pkgs))
+
+	for _, pkg := range pkgs {
+		normalized := g.NormalizePackage(pkg)
+		if !seen[normalized] {
+			queue = append(queue, normalized)
+			seen[normalized] = true
+		}
+	}
+
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+
+		pa, err := g.PullPackage(pkg)
+		if err != nil {
+			return installed, fmt.Errorf("failed to install package %s: %w", pkg, err)
+		}
+
+		installed = append(installed, pkg)
+
+		for _, dep := range pa.Meta.Deps {
+			normalized := g.NormalizePackage(dep)
+			if !seen[normalized] {
+				queue = append(queue, normalized)
+				seen[normalized] = true
+			}
+		}
+	}
+
+	return installed, nil
+}
+
+func (g *GemPullerInstaller) NormalizePackage(pkg string) string {
+	return strings.ToLower(pkg)
+}
+
+func (g *GemPullerInstaller) PullPackage(pkg string) (*Package, error) {
+	pkg = g.NormalizePackage(pkg)
+	tmp, _ := g.packages.LoadOrStore(pkg, &Package{Name: pkg})
+	pa := tmp.(*Package)
+
+	if atomic.LoadUint32(&pa.installed) == 1 {
+		return pa, nil
+	}
+
+	pa.installMutex.Lock()
+	defer pa.installMutex.Unlock()
+	if pa.installed == 0 {
+		if err := g.sandboxInstall(pa); err != nil {
+			return pa, err
+		}
+		atomic.StoreUint32(&pa.installed, 1)
+		return pa, nil
+	}
+
+	return pa, nil
+}
+
+func (g *GemPullerInstaller) sandboxInstall(pa *Package) error {
+	scratchDir := filepath.Join(g.packageDir, pa.Name)
+	log.Printf("gem install using scratchDir='%v'", scratchDir)
+	alreadyInstalled := false
+	if _, err := os.Stat(scratchDir); err == nil {
+		log.Printf("Package %v already installed", pa.Name)
+		alreadyInstalled = true
+	} else {
+		log.Printf("run gem install %s from a new Sandbox to %s on host", pa.Name, scratchDir)
+		if err := os.Mkdir(scratchDir, 0700); err != nil {
+			return err
+		}
+	}
+	var err error
+	defer func() {
+		if err != nil {
+			os.RemoveAll(scratchDir)
+		}
+	}()
+
+	defer g.cgroup.Release()
+
+	container, err := NewContainer(nil, g.baseImageDir, uuid.New().String(), g.rootDir, g.gemLambdaDir, scratchDir, g.cgroup, g.containerMeta, nil)
+	if err != nil {
+		return err
+	}
+
+	if err := container.Start(); err != nil {
+		return err
+	}
+	defer container.Destroy()
+
+	pkgReq := PullPackageRequest{
+		Pkg:              pa.Name,
+		AlreadyInstalled: alreadyInstalled,
+	}
+
+	pkgReqBytes, err := json.Marshal(pkgReq)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", "http://lambda/run/gem-lambda", bytes.NewBuffer(pkgReqBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := container.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		log.Printf("Failed to install package %s: %v", pa.Name, res.Status)
+		return fmt.Errorf("gem install failed with status %s", res.Status)
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&pa.Meta); err != nil {
+		return err
+	}
+
+	for i, pkg := range pa.Meta.Deps {
+		pa.Meta.Deps[i] = g.NormalizePackage(pkg)
 	}
 
 	return nil

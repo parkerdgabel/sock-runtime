@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"parkerdgabel/sockd/internal/bootstrap"
 	"parkerdgabel/sockd/pkg/cgroup"
+	"parkerdgabel/sockd/pkg/container/embedded"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,6 +30,17 @@ const (
 	ContainerDestroy
 	ContainerFork
 	ContainerChildExit
+)
+
+// ContainerStatus represents the current state of a container
+type ContainerStatus string
+
+const (
+	StatusCreated   ContainerStatus = "created"
+	StatusRunning   ContainerStatus = "running"
+	StatusPaused    ContainerStatus = "paused"
+	StatusStopped   ContainerStatus = "stopped"
+	StatusDestroyed ContainerStatus = "destroyed"
 )
 
 type ContainerEventHandler func(event ContainerEventType, container *Container)
@@ -61,6 +73,8 @@ type Container struct {
 	client     *http.Client
 	meta       *Meta
 	cmd        *exec.Cmd
+	status     ContainerStatus
+	logFile    *os.File
 	// 1 for self, plus 1 for each child (we can't release memory
 	// until all descendants are dead, because they share the
 	// pages of this Container, but this is the only container
@@ -80,6 +94,7 @@ func NewContainer(parent *Container, baseImageDir, id, rootDir, codeDir, scratch
 		cgroup:        cgroup,
 		client:        &http.Client{},
 		meta:          meta,
+		status:        StatusCreated,
 		children:      make(map[string]*Container),
 		cgRefCount:    1,
 		eventHandlers: listeners,
@@ -179,6 +194,11 @@ func (c *Container) Destroy() error {
 	if err := c.cgroup.Pause(); err != nil {
 		return &ContainerError{container: c.id, err: err}
 	}
+	// Close log file if open
+	if c.logFile != nil {
+		c.logFile.Close()
+	}
+	c.status = StatusDestroyed
 	c.notifyListeners(ContainerDestroy)
 	return c.decCgRefCount()
 }
@@ -196,6 +216,7 @@ func (c *Container) Start() error {
 	if err := c.cmd.Start(); err != nil {
 		return &ContainerError{container: c.id, err: fmt.Errorf("failed to start container: %v", err)}
 	}
+	c.status = StatusRunning
 	c.notifyListeners(ContainerStart)
 	return c.cmd.Wait() // Command passed in is expected to fork and exec
 }
@@ -212,6 +233,7 @@ func (c *Container) Pause() error {
 		}
 	}
 	c.client.CloseIdleConnections()
+	c.status = StatusPaused
 	c.notifyListeners(ContainerPause)
 	return nil
 }
@@ -227,12 +249,30 @@ func (c *Container) Unpause() error {
 	if err := c.cgroup.Unpause(); err != nil {
 		return &ContainerError{container: c.id, err: err}
 	}
+	c.status = StatusRunning
 	c.notifyListeners(ContainerUnpause)
 	return nil
 }
 
 func (c *Container) commsSock() string {
 	return fmt.Sprintf("%s/comms.sock", c.scratchDir)
+}
+
+func (c *Container) logPath() string {
+	return fmt.Sprintf("%s/container.log", c.scratchDir)
+}
+
+// GetLogs returns the container's stdout/stderr logs
+func (c *Container) GetLogs() (string, error) {
+	logPath := c.logPath()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // No logs yet
+		}
+		return "", fmt.Errorf("failed to read logs: %v", err)
+	}
+	return string(data), nil
 }
 
 func (c *Container) Stop() error {
@@ -245,12 +285,17 @@ func (c *Container) Stop() error {
 	if err := c.cgroup.Release(); err != nil {
 		return &ContainerError{container: c.id, err: err}
 	}
+	c.status = StatusStopped
 	c.notifyListeners(ContainerStop)
 	return nil
 }
 
 func (c *Container) Meta() *Meta {
 	return c.meta
+}
+
+func (c *Container) Status() ContainerStatus {
+	return c.status
 }
 
 // fork a new process from the Zygote in container, relocate it to be the server in dst
@@ -410,6 +455,14 @@ func (c *Container) populateRoot(baseDir string) error {
 		return &ContainerError{container: c.id, err: fmt.Errorf("failed to bind tmp dir: %v", err.Error())}
 	}
 
+	// Copy syscalls.json for seccomp filtering if enabled
+	if c.meta.SeccompEnabled {
+		syscallsPath := filepath.Join(c.rootDir, "syscalls.json")
+		if err := os.WriteFile(syscallsPath, []byte(embedded.Syscalls_json), 0644); err != nil {
+			return &ContainerError{container: c.id, err: fmt.Errorf("failed to write syscalls.json: %v", err)}
+		}
+	}
+
 	return nil
 }
 
@@ -447,29 +500,45 @@ func (c *Container) bootstrapCode() error {
 }
 
 func (c *Container) setCommand() error {
+	// Create log file for stdout/stderr capture
+	logFile, err := os.OpenFile(c.logPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return &ContainerError{container: c.id, err: fmt.Errorf("failed to create log file: %v", err)}
+	}
+	c.logFile = logFile
+
+	seccompEnabled := strconv.FormatBool(c.meta.SeccompEnabled)
+
 	switch c.meta.Runtime {
 	case Python:
 		cmd := exec.Command(
 			"chroot", c.rootDir, "python3", "-u",
 			"/runtime/python/server.py", "/host/bootstrap.py", strconv.Itoa(1),
-			strconv.FormatBool(true),
+			seccompEnabled,
 		)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
 		c.cmd = cmd
 	case Node:
 		cmd := exec.Command(
 			"chroot", c.rootDir, "node",
 			"/runtime/node/server.js", "/host/bootstrap.js", strconv.Itoa(1),
-			strconv.FormatBool(true),
+			seccompEnabled,
 		)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
 		c.cmd = cmd
 	case Ruby:
 		cmd := exec.Command(
 			"chroot", c.rootDir, "ruby",
 			"/runtime/ruby/server.rb", "/host/bootstrap.rb", strconv.Itoa(1),
-			strconv.FormatBool(true),
+			seccompEnabled,
 		)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
 		c.cmd = cmd
 	default:
+		logFile.Close()
 		return &ContainerError{container: c.id, err: fmt.Errorf("unsupported runtime: %v", c.meta.Runtime)}
 	}
 	return nil

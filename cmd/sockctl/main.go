@@ -109,10 +109,13 @@ func newCreateCmd() *cobra.Command {
 	cmd.Flags().IntVar(&meta.CPUPercent, "cpu-percent", 0, "CPU percentage limit")
 	cmd.Flags().StringVar(&meta.BaseImageName, "base-image-name", "", "Base image name")
 	cmd.Flags().StringVar(&meta.BaseImageVersion, "base-image-version", "latest", "Base image version")
+	cmd.Flags().StringVar(&meta.CodeUrl, "code-url", "", "URL to pull code from")
+	cmd.Flags().BoolVar(&meta.SeccompEnabled, "seccomp-enabled", false, "Enable seccomp filtering")
 
 	cmd.MarkFlagRequired("runtime")
 	cmd.MarkFlagRequired("base-image-name")
 	cmd.MarkFlagRequired("name")
+	cmd.MarkFlagRequired("code-url")
 
 	return cmd
 }
@@ -217,7 +220,28 @@ func newInspectCmd() *cobra.Command {
 			if err != nil {
 				log.Fatalf("Failed to inspect container: %v", err)
 			}
-			fmt.Printf("Container details: %v\n", res.Payload)
+			if !res.Success {
+				log.Fatalf("Failed to inspect container: %s", res.Message)
+			}
+			info := res.Payload.(message.InspectResponse)
+			fmt.Printf("Container: %s\n", info.Id)
+			fmt.Printf("  Status:           %s\n", info.Status)
+			fmt.Printf("  Runtime:          %s\n", info.Runtime)
+			fmt.Printf("  IsZygote:         %t\n", info.IsZygote)
+			fmt.Printf("  SeccompEnabled:   %t\n", info.SeccompEnabled)
+			fmt.Printf("  ParentID:         %s\n", info.ParentID)
+			fmt.Printf("  ChildIDs:         %v\n", info.ChildIDs)
+			fmt.Printf("  RootDir:          %s\n", info.RootDir)
+			fmt.Printf("  CodeDir:          %s\n", info.CodeDir)
+			fmt.Printf("  ScratchDir:       %s\n", info.ScratchDir)
+			fmt.Printf("  MemLimitMB:       %d\n", info.MemLimitMB)
+			fmt.Printf("  MemUsageMB:       %d\n", info.MemUsageMB)
+			fmt.Printf("  CPUPercent:       %d\n", info.CPUPercent)
+			fmt.Printf("  BaseImageName:    %s\n", info.BaseImageName)
+			fmt.Printf("  BaseImageVersion: %s\n", info.BaseImageVersion)
+			fmt.Printf("  CodeUrl:          %s\n", info.CodeUrl)
+			fmt.Printf("  Installs:         %v\n", info.Installs)
+			fmt.Printf("  Imports:          %v\n", info.Imports)
 		},
 	}
 
@@ -240,7 +264,18 @@ func newLogsCmd() *cobra.Command {
 			if err != nil {
 				log.Fatalf("Failed to get logs: %v", err)
 			}
-			fmt.Printf("Logs: %v\n", res.Payload)
+			if !res.Success {
+				log.Fatalf("Failed to get logs: %s", res.Message)
+			}
+			logsRes := res.Payload.(message.LogsResponse)
+			if logsRes.Error != "" {
+				log.Fatalf("Error getting logs: %s", logsRes.Error)
+			}
+			if logsRes.Logs == "" {
+				fmt.Println("No logs available")
+			} else {
+				fmt.Print(logsRes.Logs)
+			}
 		},
 	}
 

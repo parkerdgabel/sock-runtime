@@ -20,6 +20,7 @@ type Meta struct {
 	BaseImageName    string
 	BaseImageVersion string
 	CodeUrl          string
+	SeccompEnabled   bool
 	isLeaf           bool
 }
 
